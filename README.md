@@ -66,7 +66,3 @@ python 05_city_typology.py \
 ```
 
 All randomised analyses use fixed seeds.
-
-## Licence
-
-MIT License. See [`LICENSE`](LICENSE).
