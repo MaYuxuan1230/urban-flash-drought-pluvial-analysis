@@ -13,17 +13,11 @@ The repository contains five analysis programs:
 4. `04_gamm_response_surfaces.R` — GAMM response surfaces and marginal effects.
 5. `05_city_typology.py` — robust k-medoids typology, stability analysis and PCA.
 
-Raw-data download, raster processing, event identification and figure rendering
-are outside the scope of this release. The first script does not estimate
-temporal trends or fit frequency models. The GAMM script does not detect
-thresholds.
 
 ## Data policy
 
-Study data are not redistributed in this repository. The files in
-`example_data/` are fully synthetic and are supplied only to verify that the
-analysis workflow executes. They cannot reproduce the manuscript results.
-Required input fields are documented in [`INPUT_SCHEMA.md`](INPUT_SCHEMA.md).
+The files in `example_data/` are fully synthetic and are supplied only to verify that the
+analysis workflow executes. Required input fields are documented in [`INPUT_SCHEMA.md`](INPUT_SCHEMA.md).
 
 ## Software
 
@@ -71,9 +65,7 @@ python 05_city_typology.py \
   --clusters 4
 ```
 
-All randomised analyses use fixed seeds. `FD_only` denotes flash drought
-without a subsequent extreme-precipitation transition; `FD_P` denotes flash
-drought followed by such a transition.
+All randomised analyses use fixed seeds.
 
 ## Licence
 
