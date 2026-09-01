@@ -144,7 +144,7 @@ support_mask <- function(grid, observed, x_limits, z_limits, distance = 0.10) {
   gz <- (grid$z - z_limits[1]) / diff(z_limits)
   ox <- (observed$x - x_limits[1]) / diff(x_limits)
   oz <- (observed$z - z_limits[1]) / diff(z_limits)
-  !exclude.too.far(distance, gx, gz, ox, oz)
+  !exclude.too.far(gx, gz, ox, oz, distance)
 }
 
 
