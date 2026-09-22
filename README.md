@@ -10,8 +10,16 @@ The repository contains five analysis programs:
 1. `01_event_frequency_summary.py` — annual city-level event summaries.
 2. `02_event_response_and_metrics.py` — lagged responses and event-level metrics.
 3. `03_event_matching_and_effects.py` — matched-event comparisons.
-4. `04_gamm_response_surfaces.R` — GAMM response surfaces and marginal effects.
+4. `04_gamm_response_surfaces.py` — GAMM response surfaces, event-type contrasts and marginal effects.
 5. `05_city_typology.py` — robust k-medoids typology, stability analysis and PCA.
+
+The implementation follows the manuscript analysis: matching requires all five
+pre-event covariates; GAMMs use median city-by-event-type inputs with at least
+two events, joint event-type-specific smooths, a city random intercept, common
+30-nearest-neighbour support and 2,000 conditional posterior draws; clustering
+uses 18 k-medoids initializations and 1,000 independent 80% subsamples by
+default. The programs export numerical analysis results only and do not contain
+the manuscript plotting layer.
 
 
 ## Data policy
@@ -22,13 +30,10 @@ analysis workflow executes. Required input fields are documented in [`INPUT_SCHE
 ## Software
 
 - Python 3.11 or later
-- R 4.3 or later
 - Python packages in `requirements.txt`
-- R packages: `mgcv`, `data.table` and `arrow`
 
 ```bash
 python -m pip install -r requirements.txt
-Rscript -e "install.packages(c('mgcv','data.table','arrow'))"
 ```
 
 ## Example run
@@ -54,15 +59,20 @@ python 03_event_matching_and_effects.py \
   --metrics results/event_response_metrics.parquet \
   --output-dir results/matching
 
-Rscript 04_gamm_response_surfaces.R \
-  --metrics=results/event_response_metrics.parquet \
-  --output-dir=results/gamm
+python 04_gamm_response_surfaces.py \
+  --metrics results/event_response_metrics.parquet \
+  --output-dir results/gamm \
+  --posterior-draws 2000 \
+  --support-k 30
 
 python 05_city_typology.py \
   --metrics results/event_response_metrics.parquet \
   --city-year example_data/city_year.csv \
   --output-dir results/clustering \
-  --clusters 4
+  --clusters 0 \
+  --stability-runs 1000
 ```
 
-All randomised analyses use fixed seeds.
+The clustering program evaluates three to six groups and uses the published
+selection score when `--clusters 0`. The synthetic inputs are for execution
+checks only and are not the study data. All randomised analyses use fixed seeds.

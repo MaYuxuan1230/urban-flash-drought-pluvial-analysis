@@ -1,4 +1,5 @@
 duckdb>=1.1
+mssm>=1.2,<2
 numpy>=1.26
 pandas>=2.2
 pyarrow>=16

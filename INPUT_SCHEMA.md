@@ -52,7 +52,6 @@ Parquet table with one row per event, response variable, alignment and lag.
 | `variable` | Response-variable name |
 | `eightday_start` | Start date of the 8-day window |
 | `detrended_standardized_anomaly` | Primary event response in standardized units |
-| `standardized_anomaly` | Fallback standardized response |
 | `detrended_anomaly` | Physical-unit detrended response where required |
 
 The manuscript analyses use, among others, `evi_vegetation`, `gpp_primary`,
@@ -60,5 +59,15 @@ The manuscript analyses use, among others, `evi_vegetation`, `gpp_primary`,
 
 ## Derived tables
 
-Script 02 creates `event_response_metrics.parquet`. Scripts 03–05 read this
-derived output directly; no unpublished Figure-specific input table is needed.
+Script 02 creates `event_response_metrics.parquet`. It derives the pre-event
+EVI and VPD anomalies used by script 03. The strict matching analysis requires
+all five matching fields (`sm_min_pct_weighted`, `decline_rate_weighted`,
+`fd_duration_days_weighted`, `pre_event_evi_anomaly` and
+`pre_event_vpd_anomaly`) to be observed for both members of a pair. Scripts
+03–05 read the derived metrics directly; no unpublished Figure-specific input
+table is needed.
+
+For script 04, city-level model inputs are constructed internally as the median
+response and covariates for each city and event type, retaining groups with at
+least two source events. EVI recovery-time models use events with observed
+recovery only; right-censored events remain available for the other analyses.

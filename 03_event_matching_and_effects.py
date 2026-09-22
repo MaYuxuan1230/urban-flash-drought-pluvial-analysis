@@ -69,7 +69,8 @@ def standardised_distance(target: pd.Series, candidates: pd.DataFrame) -> pd.Ser
         distance.loc[valid] += ((values.loc[valid] - target_value) / scale) ** 2
         valid_count.loc[valid] += 1
     distance = np.sqrt(distance)
-    distance.loc[valid_count < 3] = np.inf
+    # All five published matching variables must be observed for both events.
+    distance.loc[valid_count < len(MATCH_FEATURES)] = np.inf
     return distance
 
 
@@ -86,6 +87,7 @@ def select_event_rows(metrics: pd.DataFrame) -> pd.DataFrame:
     for feature in MATCH_FEATURES:
         if feature not in event_rows.columns:
             event_rows[feature] = np.nan
+    event_rows = event_rows.dropna(subset=list(MATCH_FEATURES)).copy()
     return event_rows
 
 

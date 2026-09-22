@@ -87,12 +87,12 @@ def lag_summary(source: Path) -> pd.DataFrame:
     if duckdb is None:
         columns = [
             "event_type", "alignment", "variable", "lag",
-            "detrended_standardized_anomaly", "standardized_anomaly",
+            "detrended_standardized_anomaly",
         ]
         data = pd.read_parquet(source, columns=columns)
         data["response"] = pd.to_numeric(
             data["detrended_standardized_anomaly"], errors="coerce"
-        ).combine_first(pd.to_numeric(data["standardized_anomaly"], errors="coerce"))
+        )
         data = data.dropna(subset=["response"])
         grouped = data.groupby(
             ["event_type", "alignment", "variable", "lag"], observed=True
@@ -116,7 +116,7 @@ def lag_summary(source: Path) -> pd.DataFrame:
                 alignment,
                 variable,
                 CAST(lag AS INTEGER) AS lag,
-                COALESCE(detrended_standardized_anomaly, standardized_anomaly) AS response
+                detrended_standardized_anomaly AS response
             FROM {table}
             WHERE event_type IN ('FD_only', 'FD_P')
         )
@@ -264,8 +264,7 @@ def calculate_metrics(response_file: Path) -> pd.DataFrame:
 
     columns = [
         "event_id", "city_id", "event_type", "alignment", "lag", "variable",
-        "eightday_start", "detrended_standardized_anomaly", "standardized_anomaly",
-        "detrended_anomaly",
+        "eightday_start", "detrended_standardized_anomaly", "detrended_anomaly",
     ]
     for variable in variables:
         condition = (
@@ -278,7 +277,7 @@ def calculate_metrics(response_file: Path) -> pd.DataFrame:
         data["lag"] = pd.to_numeric(data["lag"], errors="coerce")
         data["response_value"] = pd.to_numeric(
             data["detrended_standardized_anomaly"], errors="coerce"
-        ).combine_first(pd.to_numeric(data["standardized_anomaly"], errors="coerce"))
+        )
         data["response_value_physical"] = pd.to_numeric(
             data["detrended_anomaly"], errors="coerce"
         )

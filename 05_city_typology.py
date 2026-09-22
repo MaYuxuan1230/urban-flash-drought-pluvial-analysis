@@ -4,7 +4,24 @@
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 from pathlib import Path
+
+# Avoid Windows/Conda DLL lookup failures during NumPy linear algebra when the
+# script is launched directly from PyCharm.
+_DLL_HANDLE = None
+if os.name == "nt":
+    _conda_dll = Path(sys.prefix) / "Library" / "bin"
+    if _conda_dll.is_dir():
+        os.environ["PATH"] = str(_conda_dll) + os.pathsep + os.environ.get("PATH", "")
+        if hasattr(os, "add_dll_directory"):
+            _DLL_HANDLE = os.add_dll_directory(str(_conda_dll))
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import numpy as np
 import pandas as pd
@@ -13,6 +30,9 @@ import pandas as pd
 RANDOM_SEED = 20260825
 RECOVERY_CENSOR_LIMIT_DAYS = 56.0
 MIN_EVI_EVENTS = 3
+N_INIT = 18
+MAX_ITER = 60
+STABILITY_SAMPLE_FRACTION = 0.80
 FEATURES = (
     "aridity_index", "fd_p_frequency", "gpp_loss",
     "evi_recovery_burden_days", "peak_thermal_excess",
@@ -190,21 +210,46 @@ def initialise_medoids(matrix: np.ndarray, clusters: int, seed: int) -> np.ndarr
     return np.asarray(medoids, dtype=int)
 
 
-def fit_kmedoids(matrix: np.ndarray, clusters: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
-    medoids = initialise_medoids(matrix, clusters, seed)
+def fit_kmedoids(
+    matrix: np.ndarray,
+    clusters: int,
+    seed: int,
+    n_init: int = N_INIT,
+    max_iter: int = MAX_ITER,
+) -> tuple[np.ndarray, np.ndarray]:
     distance = pairwise_manhattan(matrix)
-    for _ in range(200):
+    master = np.random.default_rng(seed)
+    best = None
+    for _ in range(n_init):
+        medoids = initialise_medoids(
+            matrix, clusters, int(master.integers(0, 2**31 - 1))
+        )
+        for _iteration in range(max_iter):
+            labels = distance[:, medoids].argmin(axis=1)
+            updated = medoids.copy()
+            for cluster in range(clusters):
+                members = np.flatnonzero(labels == cluster)
+                if len(members):
+                    costs = distance[np.ix_(members, members)].sum(axis=1)
+                    updated[cluster] = members[np.argmin(costs)]
+                else:
+                    updated[cluster] = int(np.argmax(distance[:, medoids].min(axis=1)))
+            updated = np.unique(updated)
+            if len(updated) < clusters:
+                candidates = np.argsort(distance[:, medoids].min(axis=1))[::-1]
+                fill = [index for index in candidates if index not in set(updated)]
+                updated = np.r_[updated, fill[: clusters - len(updated)]]
+            updated = np.asarray(updated[:clusters], dtype=int)
+            if np.array_equal(np.sort(updated), np.sort(medoids)):
+                medoids = updated
+                break
+            medoids = updated
         labels = distance[:, medoids].argmin(axis=1)
-        updated = medoids.copy()
-        for cluster in range(clusters):
-            members = np.flatnonzero(labels == cluster)
-            if len(members):
-                costs = distance[np.ix_(members, members)].sum(axis=1)
-                updated[cluster] = members[np.argmin(costs)]
-        if np.array_equal(updated, medoids):
-            break
-        medoids = updated
-    return medoids, distance[:, medoids].argmin(axis=1)
+        inertia = float(distance[np.arange(len(matrix)), medoids[labels]].sum())
+        candidate = (inertia, medoids.copy(), labels.copy())
+        if best is None or candidate[0] < best[0]:
+            best = candidate
+    return best[1], best[2]
 
 
 def silhouette_manhattan(matrix: np.ndarray, labels: np.ndarray) -> float:
@@ -218,6 +263,28 @@ def silhouette_manhattan(matrix: np.ndarray, labels: np.ndarray) -> float:
         b = min(distance[index, labels == other].mean() for other in clusters if other != own)
         values[index] = (b - a) / max(a, b) if max(a, b) else 0.0
     return float(values.mean())
+
+
+def davies_bouldin_manhattan(
+    matrix: np.ndarray, labels: np.ndarray, medoids: np.ndarray
+) -> float:
+    distance = pairwise_manhattan(matrix)
+    scatter = np.zeros(len(medoids), dtype=float)
+    for cluster in range(len(medoids)):
+        members = np.flatnonzero(labels == cluster)
+        scatter[cluster] = float(distance[members, medoids[cluster]].mean())
+    ratios = []
+    for first in range(len(medoids)):
+        candidates = []
+        for second in range(len(medoids)):
+            if first == second:
+                continue
+            separation = float(distance[medoids[first], medoids[second]])
+            candidates.append(
+                (scatter[first] + scatter[second]) / max(separation, 1e-12)
+            )
+        ratios.append(max(candidates))
+    return float(np.mean(ratios))
 
 
 def adjusted_rand(labels_a: np.ndarray, labels_b: np.ndarray) -> float:
@@ -234,38 +301,76 @@ def adjusted_rand(labels_a: np.ndarray, labels_b: np.ndarray) -> float:
 
 def stability(
     matrix: np.ndarray, reference: np.ndarray, clusters: int, runs: int, seed: int
-) -> tuple[float, float]:
+) -> dict[str, float]:
     rng = np.random.default_rng(seed)
     scores = []
-    size = max(clusters * 3, int(round(0.80 * len(matrix))))
+    size = min(
+        len(matrix),
+        max(clusters * 10, int(round(STABILITY_SAMPLE_FRACTION * len(matrix)))),
+    )
     for run in range(runs):
-        indices = rng.choice(len(matrix), size=size, replace=False)
-        medoids, _ = fit_kmedoids(matrix[indices], clusters, seed + run + 1)
+        indices = np.sort(rng.choice(len(matrix), size=size, replace=False))
+        medoids, _ = fit_kmedoids(
+            matrix[indices],
+            clusters,
+            seed + 1000 + run,
+            n_init=max(5, N_INIT // 3),
+            max_iter=MAX_ITER,
+        )
         predicted = pairwise_manhattan(matrix, matrix[indices][medoids]).argmin(axis=1)
         scores.append(adjusted_rand(reference, predicted))
-    return float(np.mean(scores)), float(np.std(scores, ddof=1))
+    values = np.asarray(scores, dtype=float)
+    return {
+        "mean": float(values.mean()),
+        "sd": float(values.std(ddof=1)) if len(values) > 1 else np.nan,
+        "q025": float(np.quantile(values, 0.025)),
+        "median": float(np.median(values)),
+        "q975": float(np.quantile(values, 0.975)),
+    }
 
 
 def evaluate_cluster_numbers(matrix: np.ndarray, runs: int, seed: int) -> pd.DataFrame:
     records = []
     for clusters in range(3, 7):
-        _, labels = fit_kmedoids(matrix, clusters, seed)
-        mean, sd = stability(matrix, labels, clusters, runs, seed + clusters * 100)
+        medoids, labels = fit_kmedoids(matrix, clusters, seed + clusters)
+        stability_result = stability(
+            matrix, labels, clusters, runs, seed + clusters * 100
+        )
         counts = np.bincount(labels, minlength=clusters)
         records.append({
             "n_clusters": clusters,
             "silhouette_manhattan": silhouette_manhattan(matrix, labels),
-            "stability_adjusted_rand_mean": mean,
-            "stability_adjusted_rand_sd": sd,
+            "davies_bouldin_manhattan": davies_bouldin_manhattan(
+                matrix, labels, medoids
+            ),
+            "stability_adjusted_rand_mean": stability_result["mean"],
+            "stability_adjusted_rand_sd": stability_result["sd"],
+            "stability_adjusted_rand_q025": stability_result["q025"],
+            "stability_adjusted_rand_median": stability_result["median"],
+            "stability_adjusted_rand_q975": stability_result["q975"],
             "minimum_cluster_size": int(counts.min()),
             "minimum_cluster_fraction": float(counts.min() / len(labels)),
         })
     result = pd.DataFrame.from_records(records)
-    valid = result["minimum_cluster_fraction"].ge(0.05)
-    result.loc[valid, "selection_score"] = (
-        0.6 * result.loc[valid, "silhouette_manhattan"].rank(pct=True)
-        + 0.4 * result.loc[valid, "stability_adjusted_rand_mean"].rank(pct=True)
+    def minmax(column: str, higher: bool) -> pd.Series:
+        values = result[column].astype(float)
+        span = values.max() - values.min()
+        scaled = pd.Series(np.ones(len(values)), index=values.index) if span <= 0 else (
+            values - values.min()
+        ) / span
+        return scaled if higher else 1.0 - scaled
+
+    result["silhouette_scaled"] = minmax("silhouette_manhattan", True)
+    result["stability_scaled"] = minmax("stability_adjusted_rand_mean", True)
+    result["davies_bouldin_scaled"] = minmax("davies_bouldin_manhattan", False)
+    result["size_balance_scaled"] = minmax("minimum_cluster_fraction", True)
+    result["selection_score"] = (
+        0.45 * result["silhouette_scaled"]
+        + 0.35 * result["stability_scaled"]
+        + 0.15 * result["davies_bouldin_scaled"]
+        + 0.05 * result["size_balance_scaled"]
     )
+    result.loc[result["minimum_cluster_fraction"].lt(0.08), "selection_score"] -= 0.35
     return result
 
 
@@ -290,6 +395,23 @@ def pca_scores(matrix: np.ndarray) -> tuple[np.ndarray, pd.DataFrame, np.ndarray
 
 def descriptive_names(profile: pd.DataFrame) -> dict[int, str]:
     ids = set(profile.index.astype(int))
+    if len(ids) == 3:
+        green = int((
+            profile["vegetation_fraction"]
+            - profile["gpp_loss"]
+            - profile["evi_recovery_burden_days"]
+        ).idxmax())
+        remaining = ids - {green}
+        vulnerable = int((
+            profile.loc[list(remaining), "gpp_loss"]
+            + profile.loc[list(remaining), "evi_recovery_burden_days"]
+        ).idxmax())
+        built = int(next(iter(remaining - {vulnerable})))
+        return {
+            green: "Green-buffered",
+            built: "Built-up intermediate",
+            vulnerable: "High-loss / slow-recovery",
+        }
     if len(ids) != 4:
         return {cluster: f"Cluster {cluster + 1}" for cluster in ids}
     names: dict[int, str] = {}
@@ -318,8 +440,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metrics", type=Path, required=True)
     parser.add_argument("--city-year", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--clusters", type=int, default=4, help="Use 0 for automatic selection")
-    parser.add_argument("--stability-runs", type=int, default=100)
+    parser.add_argument("--clusters", type=int, default=0, help="Use 0 for automatic selection")
+    parser.add_argument("--stability-runs", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=RANDOM_SEED)
     return parser.parse_args()
 
@@ -337,11 +459,11 @@ def main() -> None:
         eligible = evaluation.dropna(subset=["selection_score"])
         clusters = int(eligible.loc[eligible["selection_score"].idxmax(), "n_clusters"])
 
-    _, labels = fit_kmedoids(matrix, clusters, args.seed)
+    _, labels = fit_kmedoids(matrix, clusters, args.seed + clusters)
     scores, loadings, explained = pca_scores(matrix)
     scaled = pd.DataFrame(matrix, columns=FEATURES, index=included.index)
     scaled["cluster_id"] = labels
-    scaled_profile = scaled.groupby("cluster_id")[list(FEATURES)].mean()
+    scaled_profile = scaled.groupby("cluster_id")[list(FEATURES)].median()
     names = descriptive_names(scaled_profile)
 
     assignments = included.copy()
@@ -352,7 +474,7 @@ def main() -> None:
     assignments["PC1_explained_variance"] = explained[0]
     assignments["PC2_explained_variance"] = explained[1]
 
-    raw_profile = assignments.groupby(["cluster_id", "city_type"])[list(FEATURES)].mean().reset_index()
+    raw_profile = assignments.groupby(["cluster_id", "city_type"])[list(FEATURES)].median().reset_index()
     scaled_profile = scaled_profile.reset_index()
     scaled_profile["city_type"] = scaled_profile["cluster_id"].map(names)
 
