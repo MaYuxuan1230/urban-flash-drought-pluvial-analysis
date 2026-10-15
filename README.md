@@ -1,78 +1,88 @@
 # Urban flash-drought-to-pluvial analysis
 
-Code for the principal statistical analyses in the global-city
-flash-drought and post-drought pluvial-transition study.
+Reference implementation of the principal analyses in the global urban
+flash-drought-to-heavy-rainfall study. Five programs operate on analysis-ready
+city and event tables. They export numerical results, not figures.
 
 ## Scope
 
-The repository contains five analysis programs:
+| Program | Analysis |
+|---|---|
+| `01_event_frequency_summary.py` | Annual city-level counts and FD_P proportions, including zero-event years |
+| `02_event_response_and_metrics.py` | Lag trajectories, loss, nadir timing, threshold-based recovery, legacy and thermal metrics |
+| `03_event_matching_and_effects.py` | Strict five-covariate matching, balance and the six principal paired comparisons |
+| `04_gamm_response_surfaces.py` | Joint event-type-specific Gaussian GAMMs with city random intercepts, surfaces and marginal effects |
+| `05_city_typology.py` | Seven-indicator robust k-medoids typology, stability assessment and PCA |
 
-1. `01_event_frequency_summary.py` — annual city-level event summaries.
-2. `02_event_response_and_metrics.py` — lagged responses and event-level metrics.
-3. `03_event_matching_and_effects.py` — matched-event comparisons.
-4. `04_gamm_response_surfaces.py` — GAMM response surfaces, event-type contrasts and marginal effects.
-5. `05_city_typology.py` — robust k-medoids typology, stability analysis and PCA.
+Raster preprocessing, event identification, temporal-trend estimation,
+threshold detection and plotting are outside this repository. The supplied
+event catalogue is assumed to use the study's reference definition: local
+monthly P95 of rolling five-day precipitation, a 10-mm floor and a 1–20-day
+transition window. The programs do not re-identify or validate these events.
 
-The implementation follows the manuscript analysis: matching requires all five
-pre-event covariates; GAMMs use median city-by-event-type inputs with at least
-two events, joint event-type-specific smooths, a city random intercept, common
-30-nearest-neighbour support and 2,000 conditional posterior draws; clustering
-uses 18 k-medoids initializations and 1,000 independent 80% subsamples by
-default. The programs export numerical analysis results only and do not contain
-the manuscript plotting layer.
+## Data and reproducibility
 
+The files in `example_data/` are **synthetic execution examples**, not study
+data. They demonstrate interfaces and algorithms; their outputs must not be
+interpreted as manuscript estimates or used to verify published numerical
+results. The full analysis-ready observational inputs are not included here.
+The figure Source Data workbooks and these synthetic inputs are different
+resources; a figure workbook is not automatically an input to this pipeline.
 
-## Data policy
+See [INPUT_SCHEMA.md](INPUT_SCHEMA.md) for the three input tables and
+[ANALYSIS_SPEC.md](ANALYSIS_SPEC.md) for definitions, units and statistical
+scope. No figure-specific intermediate table is required by the implementation.
+Matching estimates conditional associations, not randomized causal effects.
 
-The files in `example_data/` are fully synthetic and are supplied only to verify that the
-analysis workflow executes. Required input fields are documented in [`INPUT_SCHEMA.md`](INPUT_SCHEMA.md).
+## Installation
 
-## Software
-
-- Python 3.11 or later
-- Python packages in `requirements.txt`
+Use Python 3.11 or later in a dedicated environment:
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-## Example run
+`requirements-tested.txt` records the package versions used for the local
+Windows/Python 3.11 verification. The general requirements allow compatible
+versions. GAMMs require `mssm`; no alternative model is silently substituted.
+Conda DLL-directory handling is included for direct Windows/PyCharm execution.
 
-Run commands from the repository root.
+## Run
+
+Run from the repository root. Each command below is a single line and works in
+PowerShell, a terminal, or a PyCharm run configuration with these arguments:
 
 ```bash
-mkdir results
-
-python 01_event_frequency_summary.py \
-  --events example_data/city_events.csv \
-  --city-panel example_data/city_year.csv \
-  --output results/city_year_event_summary.csv
-
-python 02_event_response_and_metrics.py \
-  --responses example_data/event_response_long.parquet \
-  --events example_data/city_events.csv \
-  --city-year example_data/city_year.csv \
-  --lag-summary results/event_lag_summary.csv \
-  --metrics results/event_response_metrics.parquet
-
-python 03_event_matching_and_effects.py \
-  --metrics results/event_response_metrics.parquet \
-  --output-dir results/matching
-
-python 04_gamm_response_surfaces.py \
-  --metrics results/event_response_metrics.parquet \
-  --output-dir results/gamm \
-  --posterior-draws 2000 \
-  --support-k 30
-
-python 05_city_typology.py \
-  --metrics results/event_response_metrics.parquet \
-  --city-year example_data/city_year.csv \
-  --output-dir results/clustering \
-  --clusters 0 \
-  --stability-runs 1000
+python 01_event_frequency_summary.py --events example_data/city_events.csv --city-panel example_data/city_year.csv --output results/city_year_event_summary.csv
+python 02_event_response_and_metrics.py --responses example_data/event_response_long.parquet --events example_data/city_events.csv --city-year example_data/city_year.csv --lag-summary results/event_lag_summary.csv --metrics results/event_response_metrics.parquet
+python 03_event_matching_and_effects.py --metrics results/event_response_metrics.parquet --output-dir results/matching
+python 04_gamm_response_surfaces.py --metrics results/event_response_metrics.parquet --output-dir results/gamm
+python 05_city_typology.py --metrics results/event_response_metrics.parquet --events example_data/city_events.csv --city-year example_data/city_year.csv --output-dir results/clustering
 ```
 
-The clustering program evaluates three to six groups and uses the published
-selection score when `--clusters 0`. The synthetic inputs are for execution
-checks only and are not the study data. All randomised analyses use fixed seeds.
+Output directories are created automatically. Default settings include 2,000
+paired bootstrap resamples, 2,000 conditional coefficient draws, 30-neighbour
+common support, 18 full-sample clustering initializations and 1,000 independent
+80% stability subsamples. `--clusters 0` evaluates 3–6 clusters; the synthetic
+example need not select the manuscript's three-cluster solution.
+
+For a quick execution check only, use `--bootstrap-draws 200`,
+`--posterior-draws 500 --support-k 5`, and
+`--clusters 3 --stability-runs 10` for programs 03, 04 and 05, respectively.
+These reduced settings are not the manuscript settings.
+
+## Tests and versioning
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Continuous integration runs the definition tests and the synthetic analysis
+chain. Passing these tests establishes implementation behaviour, not
+reproduction of the observational study. Cite an immutable commit or an
+archived release rather than an unspecified moving branch.
+
+## Licence
+
+MIT; see [LICENSE](LICENSE). No dataset licence or access permission is granted
+by the software licence.

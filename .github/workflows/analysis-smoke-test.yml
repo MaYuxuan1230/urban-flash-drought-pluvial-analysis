@@ -13,6 +13,8 @@ jobs:
         with:
           python-version: "3.11"
       - run: python -m pip install -r requirements.txt
+      - name: Test analysis definitions and input contracts
+        run: python -m unittest discover -s tests -v
       - name: Run analysis chain on synthetic inputs
         run: |
           mkdir -p results
@@ -21,4 +23,4 @@ jobs:
           python 03_event_matching_and_effects.py --metrics results/event_response_metrics.parquet --output-dir results/matching --bootstrap-draws 200
           python 04_gamm_response_surfaces.py --metrics results/event_response_metrics.parquet --output-dir results/gamm --posterior-draws 500 --support-k 5
           # Ten resamples keep CI fast; the published default is 1,000.
-          python 05_city_typology.py --metrics results/event_response_metrics.parquet --city-year example_data/city_year.csv --output-dir results/clustering --clusters 3 --stability-runs 10
+          python 05_city_typology.py --metrics results/event_response_metrics.parquet --city-year example_data/city_year.csv --events example_data/city_events.csv --output-dir results/clustering --clusters 3 --stability-runs 10

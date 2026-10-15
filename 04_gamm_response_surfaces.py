@@ -88,7 +88,15 @@ def parse_args() -> argparse.Namespace:
 def read_table(path: Path) -> pd.DataFrame:
     if path.suffix.lower() in {".parquet", ".pq"}:
         return pd.read_parquet(path)
-    return pd.read_csv(path, low_memory=False)
+    return pd.read_csv(path, low_memory=False, dtype={"city_id": "string", "event_id": "string"})
+
+
+def eligible_rows(data: pd.DataFrame) -> pd.DataFrame:
+    require_columns(data, {"event_response_eligible"}, "event metrics")
+    flag = data["event_response_eligible"].map({True: True, False: False, "True": True, "False": False, "true": True, "false": False, "1": True, "0": False})
+    if (data["event_response_eligible"].notna() & flag.isna()).any():
+        raise ValueError("event_response_eligible must be a Boolean flag.")
+    return data.loc[flag.fillna(False)].copy()
 
 
 def require_columns(data: pd.DataFrame, columns: set[str], table: str) -> None:
@@ -98,10 +106,11 @@ def require_columns(data: pd.DataFrame, columns: set[str], table: str) -> None:
 
 
 def validate_source(source: pd.DataFrame) -> str:
-    built = "built_fraction" if "built_fraction" in source else "built_up_fraction"
+    built = "built_up_fraction" if "built_up_fraction" in source else "built_fraction"
     required = {
         "event_id", "city_id", "event_type", "variable",
         "longterm_aridity_index", "vegetation_fraction", "vpd_mean_drought", built,
+        "event_response_eligible",
     }
     required.update(spec["response"] for spec in OUTCOMES.values())
     require_columns(source, required, "event metrics")
@@ -119,9 +128,10 @@ def prepare_city_data(source: pd.DataFrame, key: str, built_col: str) -> pd.Data
     ]
     if key == "evi_recovery_time":
         require_columns(source, {"recovery_observed"}, "event metrics")
-    data = source.loc[source["variable"].eq(spec["variable"])].copy()
+    data = eligible_rows(source.loc[source["variable"].eq(spec["variable"])])
     if key == "evi_recovery_time":
-        data = data.loc[data["recovery_observed"].astype("boolean").fillna(False)]
+        observed = data["recovery_observed"].map({True: True, False: False, "True": True, "False": False, "true": True, "false": False})
+        data = data.loc[observed.fillna(False)].copy()
     data["city_id"] = data["city_id"].astype(str)
     data["event_type"] = pd.Categorical(
         data["event_type"], categories=EVENT_ORDER, ordered=True
@@ -130,6 +140,10 @@ def prepare_city_data(source: pd.DataFrame, key: str, built_col: str) -> pd.Data
         data[column] = pd.to_numeric(data[column], errors="coerce")
         data.loc[~np.isfinite(data[column]), column] = np.nan
     data = data.dropna(subset=columns + ["city_id", "event_type"])
+    if data.duplicated("event_id").any():
+        raise ValueError(f"Duplicate event metrics for {key}")
+    if key == "evi_recovery_time" and data[spec["response"]].lt(0).any():
+        raise ValueError("Observed recovery time must be non-negative; do not silently clip inputs.")
 
     group = ["city_id", "event_type"]
     counts = data.groupby(group, observed=True).size().rename("n_events")
@@ -147,7 +161,7 @@ def prepare_city_data(source: pd.DataFrame, key: str, built_col: str) -> pd.Data
         city["event_type"], categories=EVENT_ORDER, ordered=True
     )
     city["response_model"] = (
-        np.log1p(np.maximum(city["response"].to_numpy(float), 0.0))
+        np.log1p(city["response"].to_numpy(float))
         if spec["transform"] == "log1p"
         else city["response"].to_numpy(float)
     )
@@ -160,7 +174,7 @@ def reference_table(source: pd.DataFrame, built_col: str) -> pd.DataFrame:
     columns = [
         "longterm_aridity_index", "vegetation_fraction", "vpd_mean_drought", built_col
     ]
-    data = source[["city_id", "event_type", *columns]].copy()
+    data = eligible_rows(source)[["city_id", "event_type", *columns]].copy()
     data["city_id"] = data["city_id"].astype(str)
     data["event_type"] = pd.Categorical(
         data["event_type"], categories=EVENT_ORDER, ordered=True
@@ -301,6 +315,7 @@ def main() -> None:
 
     for outcome_index, key in enumerate(OUTCOMES, start=1):
         city = city_data[key]
+        print(f"Fitting {key}: {len(city)} city/event-type rows, {int(city['n_events'].sum())} source events", flush=True)
         model, fixed_terms = fit_gamm(city, key)
         info = model.info
         model_rows.append({
@@ -308,6 +323,8 @@ def main() -> None:
             "model": "Gaussian GAMM (mssm)",
             "event_type_structure": "joint factor-specific smooths",
             "random_effect": "city_id random intercept",
+            "bivariate_smooth": " x ".join(OUTCOMES[key]["plane"]),
+            "minimum_valid_events_per_city_type": MIN_EVENTS,
             "n_city_event_rows": len(city),
             "n_cities": city["city_id"].nunique(),
             "n_source_events": int(city["n_events"].sum()),
@@ -318,7 +335,7 @@ def main() -> None:
             "outer_iterations": int(info.iter),
             "lambda_updates": int(info.lambda_updates),
             "response_scale": (
-                "log1p days; conditional on observed recovery"
+                "log1p days; conditional on observed threshold attainment"
                 if key == "evi_recovery_time" else "identity"
             ),
         })
@@ -404,8 +421,11 @@ def main() -> None:
             plus[climate_name] = climate_values.copy()
             minus[climate_name] = climate_values.copy()
             urban_name = "built" if key == "peak_thermal_excess" else "green"
-            plus[urban_name][:] = min(1.0, reference[urban_name] + increment_half)
-            minus[urban_name][:] = max(0.0, reference[urban_name] - increment_half)
+            # Exactly 10 percentage points, including reference values near
+            # zero or one; record the actual evaluation location explicitly.
+            urban_midpoint = float(np.clip(reference[urban_name], increment_half, 1.0 - increment_half))
+            plus[urban_name][:] = urban_midpoint + increment_half
+            minus[urban_name][:] = urban_midpoint - increment_half
             plus_data = prediction_data(
                 plus["ai"], plus["green"], plus["vpd"], plus["built"],
                 np.full(count, event_type, dtype=object), city_token,
@@ -434,6 +454,7 @@ def main() -> None:
                     "urban_increment": float(
                         plus[urban_name][0] - minus[urban_name][0]
                     ),
+                    "urban_midpoint": urban_midpoint,
                     "marginal_effect": float(estimate),
                     "ci95_low": float(ci_low), "ci95_high": float(ci_high),
                 })

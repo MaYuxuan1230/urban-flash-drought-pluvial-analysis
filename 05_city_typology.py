@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and evaluate the global-city typology from published analysis outputs."""
+"""Build the manuscript's seven-indicator city typology from analysis-ready inputs."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ import pandas as pd
 
 
 RANDOM_SEED = 20260825
-RECOVERY_CENSOR_LIMIT_DAYS = 56.0
+RECOVERY_PENALTY_DAYS = 56.0  # Fixed burden score, not an event-specific survival estimate.
 MIN_EVI_EVENTS = 3
 N_INIT = 18
 MAX_ITER = 60
@@ -43,7 +43,7 @@ FEATURES = (
 def read_table(path: Path) -> pd.DataFrame:
     if path.suffix.lower() in {".parquet", ".pq"}:
         return pd.read_parquet(path)
-    return pd.read_csv(path, low_memory=False)
+    return pd.read_csv(path, low_memory=False, dtype={"city_id": "string", "event_id": "string"})
 
 
 def write_csv(data: pd.DataFrame, path: Path) -> None:
@@ -64,7 +64,7 @@ def first_available(data: pd.DataFrame, names: tuple[str, ...], label: str) -> s
     raise ValueError(f"No column available for {label}: {', '.join(names)}")
 
 
-def build_city_features(metrics: pd.DataFrame, city_year: pd.DataFrame) -> pd.DataFrame:
+def build_city_features(metrics: pd.DataFrame, city_year: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
     """Construct clustering indicators without a separate processed cluster table."""
     require_columns(
         metrics,
@@ -72,6 +72,7 @@ def build_city_features(metrics: pd.DataFrame, city_year: pd.DataFrame) -> pd.Da
             "event_id", "city_id", "event_type", "variable",
             "loss_magnitude_lag_0_4", "recovery_time_days_after_nadir",
             "recovery_observed", "thermal_amplification_lag_0_4",
+            "event_response_eligible",
         },
         "event metrics",
     )
@@ -80,10 +81,15 @@ def build_city_features(metrics: pd.DataFrame, city_year: pd.DataFrame) -> pd.Da
     city_year = city_year.copy()
     metrics["city_id"] = metrics["city_id"].astype(str)
     city_year["city_id"] = city_year["city_id"].astype(str)
-    fd_p = metrics.loc[metrics["event_type"].eq("FD_P")].copy()
+    flag = metrics["event_response_eligible"].map({True: True, False: False, "True": True, "False": False, "true": True, "false": False, "1": True, "0": False})
+    if (metrics["event_response_eligible"].notna() & flag.isna()).any():
+        raise ValueError("event_response_eligible must be a Boolean flag.")
+    fd_p = metrics.loc[metrics["event_type"].eq("FD_P") & flag.fillna(False)].copy()
+    if fd_p.duplicated(["event_id", "variable"]).any():
+        raise ValueError("Duplicate event-variable metric rows.")
 
     ai_col = first_available(
-        city_year, ("longterm_aridity_index", "annual_aridity_index"), "aridity index"
+        city_year, ("longterm_aridity_index",), "long-term aridity index (P/PET)"
     )
     green_col = first_available(
         city_year, ("vegetation_fraction", "vegetation_fraction_mean"), "vegetation fraction"
@@ -95,6 +101,8 @@ def build_city_features(metrics: pd.DataFrame, city_year: pd.DataFrame) -> pd.Da
     for column in (ai_col, green_col, built_col):
         city_year[column] = pd.to_numeric(city_year[column], errors="coerce")
     city_year["year"] = pd.to_numeric(city_year["year"], errors="coerce")
+    if city_year.duplicated(["city_id", "year"]).any() or city_year["year"].isna().any():
+        raise ValueError("city-year table requires unique city/year rows and valid years.")
 
     aggregation = {
         "aridity_index": (ai_col, "mean"),
@@ -107,8 +115,19 @@ def build_city_features(metrics: pd.DataFrame, city_year: pd.DataFrame) -> pd.Da
     aggregation["city_name"] = ("city_name", "first")
     city = city_year.groupby("city_id", observed=True).agg(**aggregation).reset_index()
 
+    # Frequency uses the full detected-event catalogue, not the smaller
+    # ecological/QC-selected sample used for response indicators.
+    require_columns(events, {"event_id", "city_id", "event_type", "fd_onset"}, "event catalogue")
+    catalogue = events.loc[events["event_type"].isin(["FD_P", "FD_only"])].copy()
+    if catalogue["event_id"].duplicated().any():
+        raise ValueError("The event catalogue contains duplicate event identifiers.")
+    catalogue["city_id"] = catalogue["city_id"].astype(str)
+    catalogue["year"] = pd.to_datetime(catalogue["fd_onset"], errors="raise").dt.year
+    covered = catalogue.merge(city_year[["city_id", "year"]], on=["city_id", "year"], how="left", indicator=True)
+    if covered["_merge"].ne("both").any():
+        raise ValueError("city-year table omits catalogue city-years.")
     event_counts = (
-        fd_p[["city_id", "event_id"]].drop_duplicates()
+        catalogue.loc[catalogue["event_type"].eq("FD_P"), ["city_id", "event_id"]]
         .groupby("city_id", observed=True).size().rename("fd_p_events").reset_index()
     )
     city = city.merge(event_counts, on="city_id", how="left")
@@ -127,7 +146,11 @@ def build_city_features(metrics: pd.DataFrame, city_year: pd.DataFrame) -> pd.Da
     evi["recovery_time_days_after_nadir"] = pd.to_numeric(
         evi["recovery_time_days_after_nadir"], errors="coerce"
     )
-    evi["recovery_observed"] = evi["recovery_observed"].astype("boolean")
+    evi["recovery_observed"] = evi["recovery_observed"].map({True: True, False: False, "True": True, "False": False, "true": True, "false": False}).astype("boolean")
+    evi = evi.loc[evi["recovery_observed"].notna()].copy()
+    invalid_observed = evi["recovery_observed"] & (~np.isfinite(evi["recovery_time_days_after_nadir"]) | evi["recovery_time_days_after_nadir"].lt(0))
+    if invalid_observed.any():
+        raise ValueError("Observed recovery requires finite non-negative recovery days.")
     evi["observed_days"] = evi["recovery_time_days_after_nadir"].where(
         evi["recovery_observed"].fillna(False)
     )
@@ -138,10 +161,10 @@ def build_city_features(metrics: pd.DataFrame, city_year: pd.DataFrame) -> pd.Da
     ).reset_index()
     fraction = evi_city["evi_recovery_observed_fraction"].clip(0, 1)
     observed_days = evi_city["evi_recovery_time_observed_days"].fillna(
-        RECOVERY_CENSOR_LIMIT_DAYS
+        RECOVERY_PENALTY_DAYS
     )
     evi_city["evi_recovery_burden_days"] = (
-        fraction * observed_days + (1 - fraction) * RECOVERY_CENSOR_LIMIT_DAYS
+        fraction * observed_days + (1 - fraction) * RECOVERY_PENALTY_DAYS
     )
 
     thermal = fd_p.loc[fd_p["variable"].eq("thermal_excess_day_all")].copy()
@@ -259,6 +282,9 @@ def silhouette_manhattan(matrix: np.ndarray, labels: np.ndarray) -> float:
     for index in range(len(matrix)):
         own = labels[index]
         same = np.flatnonzero(labels == own)
+        if len(same) == 1:
+            values[index] = 0.0
+            continue
         a = distance[index, same[same != index]].mean() if len(same) > 1 else 0.0
         b = min(distance[index, labels == other].mean() for other in clusters if other != own)
         values[index] = (b - a) / max(a, b) if max(a, b) else 0.0
@@ -306,7 +332,7 @@ def stability(
     scores = []
     size = min(
         len(matrix),
-        max(clusters * 10, int(round(STABILITY_SAMPLE_FRACTION * len(matrix)))),
+        max(clusters + 1, int(round(STABILITY_SAMPLE_FRACTION * len(matrix)))),
     )
     for run in range(runs):
         indices = np.sort(rng.choice(len(matrix), size=size, replace=False))
@@ -332,6 +358,7 @@ def stability(
 def evaluate_cluster_numbers(matrix: np.ndarray, runs: int, seed: int) -> pd.DataFrame:
     records = []
     for clusters in range(3, 7):
+        print(f"Evaluating k={clusters}: {N_INIT} initializations and {runs} stability subsamples", flush=True)
         medoids, labels = fit_kmedoids(matrix, clusters, seed + clusters)
         stability_result = stability(
             matrix, labels, clusters, runs, seed + clusters * 100
@@ -412,33 +439,14 @@ def descriptive_names(profile: pd.DataFrame) -> dict[int, str]:
             built: "Built-up intermediate",
             vulnerable: "High-loss / slow-recovery",
         }
-    if len(ids) != 4:
-        return {cluster: f"Cluster {cluster + 1}" for cluster in ids}
-    names: dict[int, str] = {}
-    dryland = int(profile["aridity_index"].idxmin())
-    names[dryland] = "Dryland water-limited"
-    remaining = ids - {dryland}
-    built = int((profile.loc[list(remaining), "built_fraction"] + profile.loc[
-        list(remaining), "peak_thermal_excess"
-    ]).idxmax())
-    names[built] = "High-built thermal-sensitive"
-    remaining.remove(built)
-    vulnerability = (
-        profile.loc[list(remaining), "fd_p_frequency"]
-        + profile.loc[list(remaining), "gpp_loss"]
-        + profile.loc[list(remaining), "evi_recovery_burden_days"]
-    )
-    vulnerable = int(vulnerability.idxmax())
-    names[vulnerable] = "High-whiplash vulnerable"
-    remaining.remove(vulnerable)
-    names[int(next(iter(remaining)))] = "Humid buffered"
-    return names
+    return {cluster: f"Cluster {cluster + 1}" for cluster in ids}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--metrics", type=Path, required=True)
     parser.add_argument("--city-year", type=Path, required=True)
+    parser.add_argument("--events", type=Path, required=True, help="Full detected-event catalogue for annual FD_P frequency")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--clusters", type=int, default=0, help="Use 0 for automatic selection")
     parser.add_argument("--stability-runs", type=int, default=1000)
@@ -448,7 +456,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    data = build_city_features(read_table(args.metrics), read_table(args.city_year))
+    if args.stability_runs < 1 or args.clusters not in {0, 3, 4, 5, 6}:
+        raise ValueError("Use positive stability-runs and clusters=0 or 3–6.")
+    data = build_city_features(read_table(args.metrics), read_table(args.city_year), read_table(args.events))
     included, excluded = select_cities(data)
     if len(included) < 12:
         raise ValueError("At least 12 complete cities are required for clustering.")
@@ -459,7 +469,7 @@ def main() -> None:
         eligible = evaluation.dropna(subset=["selection_score"])
         clusters = int(eligible.loc[eligible["selection_score"].idxmax(), "n_clusters"])
 
-    _, labels = fit_kmedoids(matrix, clusters, args.seed + clusters)
+    medoids, labels = fit_kmedoids(matrix, clusters, args.seed + clusters)
     scores, loadings, explained = pca_scores(matrix)
     scaled = pd.DataFrame(matrix, columns=FEATURES, index=included.index)
     scaled["cluster_id"] = labels
@@ -473,10 +483,15 @@ def main() -> None:
     assignments["PC2"] = scores[:, 1]
     assignments["PC1_explained_variance"] = explained[0]
     assignments["PC2_explained_variance"] = explained[1]
+    medoid_distances = pairwise_manhattan(matrix, matrix[medoids])
+    nearest = np.sort(medoid_distances, axis=1)[:, :2]
+    assignments["membership_strength"] = 1.0 - np.divide(nearest[:, 0], nearest.sum(axis=1), out=np.full(len(nearest), 0.5), where=nearest.sum(axis=1) > 0)
 
     raw_profile = assignments.groupby(["cluster_id", "city_type"])[list(FEATURES)].median().reset_index()
     scaled_profile = scaled_profile.reset_index()
     scaled_profile["city_type"] = scaled_profile["cluster_id"].map(names)
+    profile_intervals = scaled.groupby("cluster_id")[list(FEATURES)].quantile([0.25, 0.5, 0.75]).rename_axis(index=["cluster_id", "quantile"]).reset_index()
+    profile_intervals["city_type"] = profile_intervals["cluster_id"].map(names)
 
     output = args.output_dir
     write_csv(data, output / "city_typology_input.csv")
@@ -484,6 +499,9 @@ def main() -> None:
     write_csv(excluded, output / "excluded_cities.csv")
     write_csv(raw_profile, output / "cluster_profiles_raw.csv")
     write_csv(scaled_profile, output / "cluster_profiles_robust_z.csv")
+    write_csv(profile_intervals, output / "cluster_profile_intervals_robust_z.csv")
+    medoid_table = assignments.iloc[medoids].copy()
+    write_csv(medoid_table, output / "cluster_medoids.csv")
     write_csv(evaluation, output / "cluster_number_evaluation.csv")
     write_csv(scaling, output / "robust_scaling_parameters.csv")
     write_csv(loadings, output / "pca_loadings.csv")

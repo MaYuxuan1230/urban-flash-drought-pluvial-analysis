@@ -1,0 +1,7 @@
+# Versions used for Windows/Python 3.11 verification (not a cross-platform lock).
+duckdb==1.5.4
+mssm==1.2.0
+numpy==2.4.6
+pandas==3.0.5
+pyarrow==25.0.0
+scipy==1.16.3

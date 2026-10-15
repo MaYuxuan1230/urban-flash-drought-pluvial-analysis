@@ -4,7 +4,19 @@
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 from pathlib import Path
+
+_DLL_HANDLE = None
+if os.name == "nt":
+    _dll_dir = Path(sys.prefix) / "Library" / "bin"
+    if _dll_dir.is_dir():
+        os.environ["PATH"] = str(_dll_dir) + os.pathsep + os.environ.get("PATH", "")
+        if hasattr(os, "add_dll_directory"):
+            _DLL_HANDLE = os.add_dll_directory(str(_dll_dir))
+for _name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_name, "1")
 
 import numpy as np
 import pandas as pd
@@ -21,20 +33,37 @@ MATCH_FEATURES = (
 METRICS = (
     "loss_magnitude_lag_0_4",
     "time_to_nadir_windows",
+    "time_to_nadir_days",
     "recovery_time_windows_after_nadir",
     "recovery_time_days_after_nadir",
     "legacy_mean_lag_5_8",
-    "overshoot_transition_lag_1_4",
+    "post_peak_value_lag_0_4",
     "thermal_amplification_lag_0_4",
     "thermal_amplification_sd_lag_0_4",
     "thermal_recovery_lag_windows",
+)
+PRIMARY_COMPARISONS = (
+    ("gpp_primary", "loss_magnitude_lag_0_4", "robust_standardized_units"),
+    ("gpp_primary", "time_to_nadir_days", "days"),
+    ("evi_vegetation", "recovery_time_days_after_nadir", "days"),
+    ("evi_vegetation", "legacy_mean_lag_5_8", "robust_standardized_units"),
+    ("evi_vegetation", "post_peak_value_lag_0_4", "robust_standardized_units"),
+    ("thermal_excess_day_all", "thermal_amplification_lag_0_4", "degC"),
 )
 
 
 def read_table(path: Path) -> pd.DataFrame:
     if path.suffix.lower() in {".parquet", ".pq"}:
         return pd.read_parquet(path)
-    return pd.read_csv(path, low_memory=False)
+    return pd.read_csv(path, low_memory=False, dtype={"city_id": "string", "event_id": "string"})
+
+
+def eligible_rows(data: pd.DataFrame) -> pd.DataFrame:
+    require_columns(data, {"event_response_eligible"})
+    flag = data["event_response_eligible"].map({True: True, False: False, "True": True, "False": False, "true": True, "false": False, "1": True, "0": False})
+    if (data["event_response_eligible"].notna() & flag.isna()).any():
+        raise ValueError("event_response_eligible must be a Boolean flag.")
+    return data.loc[flag.fillna(False)].copy()
 
 
 def write_table(data: pd.DataFrame, path: Path) -> None:
@@ -80,13 +109,11 @@ def select_event_rows(metrics: pd.DataFrame) -> pd.DataFrame:
         {"event_id", "city_id", "event_type", "event_year", "event_doy", "variable"},
     )
     event_rows = metrics.loc[metrics["variable"] == "evi_vegetation"].copy()
-    if "event_response_eligible" in event_rows.columns:
-        event_rows = event_rows.loc[event_rows["event_response_eligible"].fillna(False)]
+    event_rows = eligible_rows(event_rows)
     event_rows = event_rows.loc[event_rows["event_type"].isin(["FD_P", "FD_only"])]
     event_rows = event_rows.drop_duplicates("event_id").sort_values("event_id")
-    for feature in MATCH_FEATURES:
-        if feature not in event_rows.columns:
-            event_rows[feature] = np.nan
+    require_columns(event_rows, set(MATCH_FEATURES))
+    event_rows[list(MATCH_FEATURES)] = event_rows[list(MATCH_FEATURES)].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
     event_rows = event_rows.dropna(subset=list(MATCH_FEATURES)).copy()
     return event_rows
 
@@ -131,6 +158,8 @@ def match_events(metrics: pd.DataFrame, max_distance: float) -> pd.DataFrame:
             ) / 30.0
             if np.isfinite(distance).any():
                 index = distance.idxmin()
+                if distance.loc[index] > max_distance:
+                    continue
                 chosen = candidates.loc[index]
                 chosen_scope = scope
                 chosen_distance = float(distance.loc[index])
@@ -156,6 +185,14 @@ def match_events(metrics: pd.DataFrame, max_distance: float) -> pd.DataFrame:
 
 
 def matched_differences(metrics: pd.DataFrame, pairs: pd.DataFrame) -> pd.DataFrame:
+    metrics = eligible_rows(metrics)
+    if metrics.duplicated(["event_id", "variable"]).any():
+        raise ValueError("metrics must have one row per event and response variable.")
+    metrics = metrics.copy()
+    observed = metrics["recovery_observed"].map({True: True, False: False, "True": True, "False": False, "true": True, "false": False})
+    for column in ("recovery_time_days_after_nadir", "recovery_time_windows_after_nadir"):
+        if column in metrics:
+            metrics.loc[~observed.fillna(False), column] = np.nan
     available_metrics = [name for name in METRICS if name in metrics.columns]
     values = metrics[["event_id", "variable", *available_metrics]].copy()
     fd_p = pairs[["pair_id", "fd_p_event_id"]].merge(
@@ -183,9 +220,15 @@ def matched_differences(metrics: pd.DataFrame, pairs: pd.DataFrame) -> pd.DataFr
 
 
 def bootstrap_interval(values: np.ndarray, draws: int, seed: int) -> tuple[float, float]:
+    if draws < 1:
+        raise ValueError("bootstrap draws must be positive.")
     rng = np.random.default_rng(seed)
-    indices = rng.integers(0, len(values), size=(draws, len(values)))
-    means = values[indices].mean(axis=1)
+    means = np.empty(draws)
+    batch = max(1, min(128, 2_000_000 // len(values)))
+    for start in range(0, draws, batch):
+        stop = min(draws, start + batch)
+        indices = rng.integers(0, len(values), size=(stop - start, len(values)))
+        means[start:stop] = values[indices].mean(axis=1)
     return tuple(np.quantile(means, [0.025, 0.975]))
 
 
@@ -205,32 +248,38 @@ def effect_summary(
     bootstrap_draws: int,
     seed: int,
 ) -> pd.DataFrame:
-    columns = [column for column in differences if column.endswith("_difference_fd_p_minus_fd_only")]
     records = []
-    for variable in sorted(differences["variable"].dropna().unique()):
+    for variable, metric, unit in PRIMARY_COMPARISONS:
         subset = differences.loc[differences["variable"] == variable]
-        for column in columns:
-            values = pd.to_numeric(subset[column], errors="coerce").dropna().to_numpy()
-            if len(values) < 2:
-                continue
-            ci_low, ci_high = bootstrap_interval(values, bootstrap_draws, seed)
-            try:
-                p_value = float(wilcoxon(values, zero_method="wilcox", alternative="two-sided").pvalue)
-            except ValueError:
-                p_value = np.nan
-            records.append(
-                {
+        column = f"{metric}_difference_fd_p_minus_fd_only"
+        if column not in subset:
+            raise ValueError(f"Missing principal comparison: {column}")
+        values = pd.to_numeric(subset[column], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna().to_numpy()
+        if len(values) < 2:
+            continue
+        ci_low, ci_high = bootstrap_interval(values, bootstrap_draws, seed)
+        sd = float(values.std(ddof=1))
+        try:
+            p_value = float(wilcoxon(values, zero_method="wilcox", alternative="two-sided").pvalue) if np.any(values != 0) else 1.0
+        except ValueError:
+            p_value = np.nan
+        records.append({
                     "variable": variable,
                     "metric": column.removesuffix("_difference_fd_p_minus_fd_only"),
                     "n_pairs": len(values),
                     "mean_difference": float(values.mean()),
                     "median_difference": float(np.median(values)),
-                    "sd_difference": float(values.std(ddof=1)),
+                    "sd_difference": sd,
+                    "unit": unit,
                     "bootstrap_ci_low": ci_low,
                     "bootstrap_ci_high": ci_high,
                     "wilcoxon_p": p_value,
-                }
-            )
+                    "standardized_paired_effect": float(values.mean() / sd) if sd > 0 else np.nan,
+                    "standardized_ci_low": float(ci_low / sd) if sd > 0 else np.nan,
+                    "standardized_ci_high": float(ci_high / sd) if sd > 0 else np.nan,
+                    "ci_resampling_unit": "complete_matched_pair",
+                    "estimand": "mean FD_P minus FD_only; observed pairs for recovery",
+                })
     summary = pd.DataFrame.from_records(records)
     if not summary.empty:
         summary["fdr_q"] = false_discovery_rate(summary["wilcoxon_p"])

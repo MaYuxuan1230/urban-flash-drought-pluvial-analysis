@@ -9,7 +9,19 @@ events and processes one variable at a time to limit memory use.
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 from pathlib import Path
+
+_DLL_HANDLE = None
+if os.name == "nt":
+    _dll_dir = Path(sys.prefix) / "Library" / "bin"
+    if _dll_dir.is_dir():
+        os.environ["PATH"] = str(_dll_dir) + os.pathsep + os.environ.get("PATH", "")
+        if hasattr(os, "add_dll_directory"):
+            _DLL_HANDLE = os.add_dll_directory(str(_dll_dir))
+for _name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_name, "1")
 
 import numpy as np
 import pandas as pd
@@ -38,7 +50,7 @@ def sql_path(path: Path) -> str:
 def read_table(path: Path) -> pd.DataFrame:
     if path.suffix.lower() in {".parquet", ".pq"}:
         return pd.read_parquet(path)
-    return pd.read_csv(path, low_memory=False)
+    return pd.read_csv(path, low_memory=False, dtype={"city_id": "string", "event_id": "string"})
 
 
 def write_table(data: pd.DataFrame, path: Path) -> None:
@@ -86,14 +98,20 @@ def first_consecutive_lag(
 def lag_summary(source: Path) -> pd.DataFrame:
     if duckdb is None:
         columns = [
-            "event_type", "alignment", "variable", "lag",
+            "event_id", "event_type", "alignment", "variable", "lag",
             "detrended_standardized_anomaly",
         ]
         data = pd.read_parquet(source, columns=columns)
         data["response"] = pd.to_numeric(
             data["detrended_standardized_anomaly"], errors="coerce"
         )
-        data = data.dropna(subset=["response"])
+        data = data.loc[np.isfinite(data["response"]) & data["event_type"].isin(["FD_only", "FD_P"])]
+        fd = data.loc[data["alignment"].eq("fd")].copy()
+        fd["pre_valid"] = fd["lag"].between(-4, -1)
+        fd["post_valid"] = fd["lag"].between(0, 4)
+        counts = fd.groupby(["event_id", "variable"])[["pre_valid", "post_valid"]].sum()
+        keep = counts.loc[counts["pre_valid"].ge(3) & counts["post_valid"].ge(4)].reset_index()
+        data = data.merge(keep[["event_id", "variable"]], on=["event_id", "variable"], how="inner")
         grouped = data.groupby(
             ["event_type", "alignment", "variable", "lag"], observed=True
         )["response"]
@@ -110,14 +128,18 @@ def lag_summary(source: Path) -> pd.DataFrame:
     connection = duckdb.connect()
     table = f"read_parquet('{sql_path(source)}')"
     query = f"""
-        WITH x AS (
+        WITH eligible AS (
+            SELECT event_id, variable FROM {table}
+            WHERE alignment = 'fd' AND event_type IN ('FD_only', 'FD_P')
+            GROUP BY event_id, variable
+            HAVING COUNT(*) FILTER (WHERE lag BETWEEN -4 AND -1 AND isfinite(detrended_standardized_anomaly)) >= 3
+               AND COUNT(*) FILTER (WHERE lag BETWEEN 0 AND 4 AND isfinite(detrended_standardized_anomaly)) >= 4
+        ), x AS (
             SELECT
-                event_type,
-                alignment,
-                variable,
-                CAST(lag AS INTEGER) AS lag,
-                detrended_standardized_anomaly AS response
-            FROM {table}
+                r.event_type, r.alignment, r.variable,
+                CAST(r.lag AS INTEGER) AS lag,
+                r.detrended_standardized_anomaly AS response
+            FROM {table} r INNER JOIN eligible e USING (event_id, variable)
             WHERE event_type IN ('FD_only', 'FD_P')
         )
         SELECT
@@ -131,7 +153,7 @@ def lag_summary(source: Path) -> pd.DataFrame:
             AVG(response) - 1.96 * STDDEV_SAMP(response) / SQRT(COUNT(response)) AS ci_low,
             AVG(response) + 1.96 * STDDEV_SAMP(response) / SQRT(COUNT(response)) AS ci_high
         FROM x
-        WHERE response IS NOT NULL
+        WHERE response IS NOT NULL AND isfinite(response)
         GROUP BY event_type, alignment, variable, lag
         ORDER BY variable, alignment, event_type, lag
     """
@@ -141,7 +163,7 @@ def lag_summary(source: Path) -> pd.DataFrame:
 
 
 def metric_record(group: pd.DataFrame, transition: pd.DataFrame | None) -> dict:
-    group = group.sort_values("lag")
+    group = group.loc[group["lag"].between(-4, 8)].sort_values("lag")
     pre = group.loc[group["lag"].between(-4, -1)]
     post = group.loc[group["lag"].between(0, 4)].dropna(subset=["response_value"])
     legacy = group.loc[group["lag"].between(5, 8)]
@@ -161,6 +183,8 @@ def metric_record(group: pd.DataFrame, transition: pd.DataFrame | None) -> dict:
         int(nadir_lag) + 1 if np.isfinite(nadir_lag) else 0,
         "ecological",
     )
+    if not np.isfinite(nadir_lag):
+        recovery_lag, recovery_censored = np.nan, True
     recovery_windows = (
         recovery_lag - nadir_lag
         if np.isfinite(recovery_lag) and np.isfinite(nadir_lag)
@@ -168,6 +192,8 @@ def metric_record(group: pd.DataFrame, transition: pd.DataFrame | None) -> dict:
     )
 
     recovery_days = np.nan
+    nadir_day = anchor_day = pd.NaT
+    time_to_nadir_days = np.nan
     censor_windows = np.nan
     censor_days = np.nan
     if np.isfinite(nadir_lag):
@@ -175,6 +201,13 @@ def metric_record(group: pd.DataFrame, transition: pd.DataFrame | None) -> dict:
             group.loc[group["lag"] == int(nadir_lag), "eightday_start"],
             errors="coerce",
         ).dropna()
+        anchor_dates = pd.to_datetime(group.loc[group["lag"].eq(0), "eightday_start"], errors="coerce").dropna()
+        if len(nadir_dates):
+            nadir_day = nadir_dates.iloc[0]
+        if len(anchor_dates):
+            anchor_day = anchor_dates.iloc[0]
+        if pd.notna(nadir_day) and pd.notna(anchor_day):
+            time_to_nadir_days = float((nadir_day - anchor_day).days)
         follow = group.loc[(group["lag"] >= nadir_lag) & group["response_value"].notna()]
         if not follow.empty:
             last_lag = int(follow["lag"].max())
@@ -231,6 +264,9 @@ def metric_record(group: pd.DataFrame, transition: pd.DataFrame | None) -> dict:
         "nadir_value_lag_0_4": nadir_value,
         "loss_magnitude_lag_0_4": -nadir_value if np.isfinite(nadir_value) else np.nan,
         "time_to_nadir_windows": nadir_lag,
+        "time_to_nadir_days": time_to_nadir_days,
+        "nadir_window_start": nadir_day,
+        "fd_alignment_window_start": anchor_day,
         "recovery_lag_windows": recovery_lag,
         "recovery_time_windows_after_nadir": recovery_windows,
         "recovery_time_days_after_nadir": recovery_days,
@@ -238,6 +274,9 @@ def metric_record(group: pd.DataFrame, transition: pd.DataFrame | None) -> dict:
         "recovery_censored": recovery_censored,
         "recovery_censor_time_windows": censor_windows,
         "recovery_censor_time_days": censor_days,
+        # Diagnostic only: retain the manuscript's threshold-attainment
+        # definition rather than silently changing its recovery risk set.
+        "nadir_below_recovery_threshold": bool(nadir_value < RECOVERY_THRESHOLD) if np.isfinite(nadir_value) else pd.NA,
         "legacy_mean_lag_5_8": legacy["response_value"].mean(),
         "post_peak_value_lag_0_4": peak_value,
         "post_peak_lag": peak_lag,
@@ -281,6 +320,15 @@ def calculate_metrics(response_file: Path) -> pd.DataFrame:
         data["response_value_physical"] = pd.to_numeric(
             data["detrended_anomaly"], errors="coerce"
         )
+        data["response_value"] = data["response_value"].where(np.isfinite(data["response_value"]))
+        data["response_value_physical"] = data["response_value_physical"].where(np.isfinite(data["response_value_physical"]))
+        data["eightday_start"] = pd.to_datetime(data["eightday_start"], errors="raise")
+        data["event_id"] = data["event_id"].astype(str)
+        data["city_id"] = data["city_id"].astype(str)
+        if data.duplicated(["event_id", "alignment", "lag"]).any():
+            raise ValueError(f"Duplicate event/alignment/lag rows for {variable}.")
+        if data.groupby("event_id")[["city_id", "event_type"]].nunique().gt(1).any().any():
+            raise ValueError("An event identifier maps to conflicting city or event type.")
         data = data.sort_values(["event_id", "alignment", "lag"], kind="stable")
 
         transition_lookup = {
@@ -302,7 +350,7 @@ def calculate_metrics(response_file: Path) -> pd.DataFrame:
     metrics = pd.concat(parts, ignore_index=True)
 
     context = metrics.loc[
-        metrics["variable"].isin(["evi_vegetation", "vpd_mean"]),
+        metrics["variable"].isin(["evi_vegetation", "vpd_mean"]) & metrics["valid_pre_windows"].ge(3),
         ["event_id", "variable", "baseline_mean_lag_m4_m1"],
     ].pivot_table(
         index="event_id", columns="variable", values="baseline_mean_lag_m4_m1", aggfunc="first"
@@ -324,10 +372,12 @@ def add_event_context(
     events = read_table(events_file).copy()
     require_columns(events, {"event_id", "city_id", "event_type", "fd_onset"}, "events")
     events["city_id"] = events["city_id"].astype(str)
+    events["event_id"] = events["event_id"].astype(str)
     events["fd_onset"] = pd.to_datetime(events["fd_onset"], errors="coerce")
     events["event_year"] = events["fd_onset"].dt.year
     events["event_doy"] = events["fd_onset"].dt.dayofyear
-    events = events.drop_duplicates("event_id")
+    if events["event_id"].duplicated().any() or events["fd_onset"].isna().any():
+        raise ValueError("events must have unique identifiers and valid onset dates.")
 
     keys = {"event_id", "city_id", "event_type"}
     event_columns = [column for column in events.columns if column not in keys]
@@ -335,14 +385,18 @@ def add_event_context(
         events[[*keys, *event_columns]],
         on=["event_id", "city_id", "event_type"],
         how="left",
-        validate="many_to_one",
+        validate="many_to_one", indicator=True,
     )
+    if result["_merge"].ne("both").any():
+        raise ValueError("A response event is absent from the matching event catalogue.")
+    result = result.drop(columns="_merge")
 
     city_year = read_table(city_year_file).copy()
     require_columns(city_year, {"city_id", "year"}, "city-year table")
     city_year["city_id"] = city_year["city_id"].astype(str)
     city_year = city_year.rename(columns={"year": "event_year"})
-    city_year = city_year.drop_duplicates(["city_id", "event_year"])
+    if city_year.duplicated(["city_id", "event_year"]).any():
+        raise ValueError("city-year table contains duplicate city/year rows.")
     context_columns = [
         column
         for column in (
@@ -381,12 +435,11 @@ def main() -> None:
     args = parse_args()
     if args.responses.suffix.lower() not in {".parquet", ".pq"}:
         raise ValueError("--responses must be a Parquet file for memory-efficient processing.")
-    summary = lag_summary(args.responses)
-    write_table(summary, args.lag_summary)
-
     metrics = calculate_metrics(args.responses)
     metrics = add_event_context(metrics, args.events, args.city_year)
     write_table(metrics, args.metrics)
+    summary = lag_summary(args.responses)
+    write_table(summary, args.lag_summary)
     print(f"Wrote {len(metrics):,} event-variable metric records to {args.metrics}")
 
 

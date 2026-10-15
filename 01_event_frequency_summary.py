@@ -8,7 +8,20 @@ events and does not estimate temporal trends or fit frequency models.
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 from pathlib import Path
+
+# Retain the DLL handle for direct Windows/Conda execution in PyCharm.
+_DLL_HANDLE = None
+if os.name == "nt":
+    _dll_dir = Path(sys.prefix) / "Library" / "bin"
+    if _dll_dir.is_dir():
+        os.environ["PATH"] = str(_dll_dir) + os.pathsep + os.environ.get("PATH", "")
+        if hasattr(os, "add_dll_directory"):
+            _DLL_HANDLE = os.add_dll_directory(str(_dll_dir))
+for _name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_name, "1")
 
 import numpy as np
 import pandas as pd
@@ -20,7 +33,7 @@ EVENT_TYPES = ("FD_only", "FD_P")
 def read_table(path: Path) -> pd.DataFrame:
     if path.suffix.lower() in {".parquet", ".pq"}:
         return pd.read_parquet(path)
-    return pd.read_csv(path, low_memory=False)
+    return pd.read_csv(path, low_memory=False, dtype={"city_id": "string", "event_id": "string"})
 
 
 def write_table(data: pd.DataFrame, path: Path) -> None:
@@ -41,7 +54,10 @@ def summarise(events: pd.DataFrame, city_panel: pd.DataFrame) -> pd.DataFrame:
     require_columns(events, {"event_id", "city_id", "event_type", "fd_onset"})
     data = events.loc[events["event_type"].isin(EVENT_TYPES)].copy()
     data["fd_onset"] = pd.to_datetime(data["fd_onset"], errors="coerce")
-    data = data.dropna(subset=["fd_onset"])
+    if data[["event_id", "city_id", "fd_onset"]].isna().any().any():
+        raise ValueError("Flash-drought identifiers and onset dates must be valid.")
+    if data["event_id"].duplicated().any():
+        raise ValueError("city_events must contain one row per flash-drought event.")
     data["year"] = data["fd_onset"].dt.year.astype(int)
     data["city_id"] = data["city_id"].astype(str)
 
@@ -79,7 +95,11 @@ def summarise(events: pd.DataFrame, city_panel: pd.DataFrame) -> pd.DataFrame:
     panel = city_panel.copy()
     panel["city_id"] = panel["city_id"].astype(str)
     panel["year"] = pd.to_numeric(panel["year"], errors="raise").astype(int)
-    panel = panel.drop_duplicates(["city_id", "year"])
+    if panel.duplicated(["city_id", "year"]).any():
+        raise ValueError("city-panel must contain one row per city and year.")
+    unmatched = event_summary.merge(panel[["city_id", "year"]], on=["city_id", "year"], how="left", indicator=True)
+    if unmatched["_merge"].eq("left_only").any():
+        raise ValueError("city-panel omits a city-year present in the event catalogue.")
     overlapping = [
         column for column in event_summary.columns
         if column in panel.columns and column not in {"city_id", "year"}
@@ -92,6 +112,9 @@ def summarise(events: pd.DataFrame, city_panel: pd.DataFrame) -> pd.DataFrame:
         result["fd_p_count"], result["fd_count"],
         out=np.full(len(result), np.nan), where=result["fd_count"].to_numpy() > 0,
     )
+    # Keep all supplied cities/zero-event years; do not silently impose the
+    # smaller, at-least-one-FD_P map cohort on global annual denominators.
+    result["has_fd_p_in_study_period"] = result.groupby("city_id")["fd_p_count"].transform("sum").gt(0)
 
     return result
 
